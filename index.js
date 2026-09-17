@@ -1,10 +1,223 @@
-const fs=require('fs'),path=require('path'); const {DatabaseSync}=require('node:sqlite'); let db;
-const fresh=()=>({name:'Adventurer',hp:{current:100,max:100},mp:{current:100,max:100},stamina:{current:100,max:100},inventory:[],equipment:[],conditions:[],turn:0,history:[]});
-function initDb(){let d=path.join(__dirname,'data');fs.mkdirSync(d,{recursive:true});db=new DatabaseSync(path.join(d,'rpg-engine.sqlite'));db.exec(`CREATE TABLE IF NOT EXISTS campaign_state(campaign TEXT PRIMARY KEY,state_json TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS event_ledger(id INTEGER PRIMARY KEY AUTOINCREMENT,campaign TEXT NOT NULL,created_at TEXT NOT NULL,type TEXT NOT NULL,detail TEXT NOT NULL);`)}
-function save(c,s){let x={...s};delete x.history;db.prepare(`INSERT INTO campaign_state VALUES(?,?,?) ON CONFLICT(campaign) DO UPDATE SET state_json=excluded.state_json,updated_at=excluded.updated_at`).run(c,JSON.stringify(x),new Date().toISOString())}
-function log(c,t,d){db.prepare(`INSERT INTO event_ledger(campaign,created_at,type,detail) VALUES(?,?,?,?)`).run(c,new Date().toISOString(),t,d)}
-function get(c){let r=db.prepare(`SELECT state_json FROM campaign_state WHERE campaign=?`).get(c),s=r?JSON.parse(r.state_json):fresh();if(!r)save(c,s);s.history=db.prepare(`SELECT created_at,type,detail FROM event_ledger WHERE campaign=? ORDER BY id DESC LIMIT 50`).all(c);return s}
-function apply(c,a,p={}){let s=get(c);if(a==='reset'){db.prepare(`DELETE FROM event_ledger WHERE campaign=?`).run(c);s=fresh();save(c,s);log(c,'RESET','State reset');return get(c)}if(a==='set_name'){let old=s.name;s.name=String(p.name).slice(0,120);log(c,'NAME',`${old} → ${s.name}`)}if(a==='resource_delta'){if(!['hp','mp','stamina'].includes(p.resource))throw Error('Bad resource');let q=s[p.resource],b=q.current;q.current=Math.max(0,Math.min(q.max,b+Number(p.delta||0)));log(c,p.resource.toUpperCase(),`${b} → ${q.current}`)}if(a==='inventory_add'){let n=String(p.name||'').trim(),q=Math.max(1,Math.floor(Number(p.qty||1)));if(!n)throw Error('Item required');let f=s.inventory.find(x=>x.name.toLowerCase()===n.toLowerCase());f?f.qty+=q:s.inventory.push({name:n,qty:q});log(c,'ITEM+',`${n} ×${q}`)}if(a==='condition_add'){let n=String(p.name||'').trim(),t=p.turns==null?null:Math.max(1,Math.floor(Number(p.turns)));if(!n)throw Error('Condition required');s.conditions.push({name:n,turns:t});log(c,'CONDITION+',n)}if(a==='next_turn'){s.turn++;let ex=[];s.conditions.forEach(x=>{if(x.turns!=null&&--x.turns<=0)ex.push(x.name)});s.conditions=s.conditions.filter(x=>x.turns==null||x.turns>0);log(c,'TURN',`Turn ${s.turn}${ex.length?'; expired: '+ex.join(', '):''}`)}save(c,s);return get(c)}
-async function init(router){initDb();router.get('/state',(req,res)=>{try{res.json({state:get(String(req.query.campaign||'global::default'))})}catch(e){res.status(500).json({error:e.message})}});router.post('/action',(req,res)=>{try{let {campaign='global::default',action,payload={}}=req.body||{};if(!action)return res.status(400).json({error:'action required'});res.json({state:apply(String(campaign),String(action),payload)})}catch(e){res.status(400).json({error:e.message})}});console.log('[ST RPG Engine] v0.1 loaded')}
-async function exit(){try{db?.close()}catch{}}
-module.exports={init,exit,info:{id:'st-rpg-engine',name:'ST RPG Engine',description:'Deterministic RPG state with SQLite persistence'}};
+const API = '/api/plugins/st-rpg-engine';
+let state = null;
+
+const C = () => SillyTavern.getContext();
+
+const key = () =>
+    `${C().characterId ?? C().groupId ?? 'global'}::${C().chatId ?? 'default'}`;
+
+async function api(p, o = {}) {
+    const r = await fetch(API + p, {
+        ...o,
+        headers: {
+            'Content-Type': 'application/json',
+            ...(o.headers || {}),
+        },
+    });
+
+    const d = await r.json().catch(() => ({}));
+
+    if (!r.ok) {
+        throw Error(d.error || r.status);
+    }
+
+    return d;
+}
+
+const esc = (s) =>
+    String(s ?? '').replace(
+        /[&<>"']/g,
+        (c) =>
+            ({
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#39;',
+            })[c],
+    );
+
+function render() {
+    if (!state) return;
+
+    $('#rpg-char-name').text(state.name);
+
+    $('#rpg-resources').html(
+        ['hp', 'mp', 'stamina']
+            .map(
+                (k) => `
+        <div class="rpg-resource">
+            <div class="rpg-row">
+                <b>${k.toUpperCase()}</b>
+                <span>${state[k].current} / ${state[k].max}</span>
+            </div>
+
+            <div class="rpg-meter">
+                <i style="width:${
+                    (state[k].current / state[k].max) * 100
+                }%"></i>
+            </div>
+
+            <div class="rpg-buttons">
+                ${[-10, -1, 1, 10]
+                    .map(
+                        (n) => `
+                    <button
+                        class="menu_button rpg-r"
+                        data-k="${k}"
+                        data-n="${n}"
+                    >
+                        ${n > 0 ? '+' : ''}${n}
+                    </button>
+                `,
+                    )
+                    .join('')}
+            </div>
+        </div>
+    `,
+            )
+            .join(''),
+    );
+
+    $('.rpg-r').on('click', function () {
+        act('resource_delta', {
+            resource: $(this).data('k'),
+            delta: Number($(this).data('n')),
+        });
+    });
+
+    $('#rpg-conditions').html(
+        state.conditions.length
+            ? state.conditions
+                  .map(
+                      (x) =>
+                          `<span class="rpg-chip">${esc(x.name)}${
+                              x.turns != null ? ' (' + x.turns + ')' : ''
+                          }</span>`,
+                  )
+                  .join('')
+            : '<span class="rpg-muted">None</span>',
+    );
+
+    $('#rpg-inventory').html(
+        state.inventory.length
+            ? state.inventory
+                  .map(
+                      (x) =>
+                          `<div class="rpg-row">
+                              <span>${esc(x.name)}</span>
+                              <b>×${x.qty}</b>
+                          </div>`,
+                  )
+                  .join('')
+            : '<span class="rpg-muted">Empty</span>',
+    );
+
+    $('#rpg-history').html(
+        state.history.length
+            ? state.history
+                  .slice(0, 20)
+                  .map(
+                      (x) =>
+                          `<div class="rpg-history">
+                              <b>${esc(x.type)}</b> ${esc(x.detail)}
+                          </div>`,
+                  )
+                  .join('')
+            : '<span class="rpg-muted">No events yet</span>',
+    );
+}
+
+async function load() {
+    try {
+        state = (
+            await api('/state?campaign=' + encodeURIComponent(key()))
+        ).state;
+
+        $('#rpg-server-status').text('SQLite connected');
+
+        render();
+    } catch (e) {
+        $('#rpg-server-status').text('Server plugin offline');
+        console.error('[RPG Engine]', e);
+    }
+}
+
+async function act(action, payload = {}) {
+    state = (
+        await api('/action', {
+            method: 'POST',
+            body: JSON.stringify({
+                campaign: key(),
+                action,
+                payload,
+            }),
+        })
+    ).state;
+
+    render();
+}
+
+async function init() {
+    if ($('#rpg-engine-panel').length) return;
+
+    const panelUrl = new URL('./panel.html', import.meta.url).href;
+    $('body').append(await $.get(panelUrl));
+
+    $('#rpg-engine-fab').on('click', () => {
+        $('#rpg-engine-panel').addClass('open');
+        load();
+    });
+
+    $('#rpg-close').on('click', () =>
+        $('#rpg-engine-panel').removeClass('open'),
+    );
+
+    $('#rpg-refresh').on('click', load);
+
+    $('#rpg-next-turn').on('click', () => act('next_turn'));
+
+    $('#rpg-reset').on('click', () => {
+        if (confirm('Reset this chat RPG state?')) {
+            act('reset');
+        }
+    });
+
+    $('#rpg-set-name').on('click', () => {
+        const name = prompt(
+            'Character name',
+            state?.name || 'Adventurer',
+        );
+
+        if (name?.trim()) {
+            act('set_name', {
+                name: name.trim(),
+            });
+        }
+    });
+
+    $('#rpg-add-item').on('click', () => {
+        const name = $('#rpg-item-name').val().trim();
+
+        if (name) {
+            act('inventory_add', {
+                name,
+                qty: Number($('#rpg-item-qty').val() || 1),
+            });
+        }
+    });
+
+    $('#rpg-add-condition').on('click', () => {
+        const name = $('#rpg-condition-name').val().trim();
+        const turns = $('#rpg-condition-turns').val();
+
+        if (name) {
+            act('condition_add', {
+                name,
+                turns: turns === '' ? null : Number(turns),
+            });
+        }
+    });
+}
+
+jQuery(init);
