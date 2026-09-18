@@ -10,7 +10,7 @@ async function api(p, o = {}) {
     const r = await fetch(API + p, {
         ...o,
         headers: {
-            'Content-Type': 'application/json',
+            ...C().getRequestHeaders(),
             ...(o.headers || {}),
         },
     });
@@ -183,16 +183,22 @@ async function init() {
         }
     });
 
-    $('#rpg-set-name').on('click', () => {
-        const name = prompt(
-            'Character name',
-            state?.name || 'Adventurer',
-        );
+    $('#rpg-set-name').on('click', async () => {
+        try {
+            const name = await C().Popup.show.input(
+                'Character name',
+                'Enter the name for this chat’s RPG character.',
+                state?.name || 'Adventurer',
+            );
 
-        if (name?.trim()) {
-            act('set_name', {
-                name: name.trim(),
-            });
+            if (name?.trim()) {
+                await act('set_name', {
+                    name: name.trim(),
+                });
+            }
+        } catch (error) {
+            console.error('[RPG Engine] Rename failed', error);
+            toastr.error('Could not save the character name. Refresh the RPG panel and try again.');
         }
     });
 
