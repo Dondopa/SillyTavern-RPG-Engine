@@ -1,10 +1,37 @@
+import { campaignKey, createContextBridge } from './llm-context.mjs';
+
 const API = '/api/plugins/st-rpg-engine';
 let state = null;
 
 const C = () => SillyTavern.getContext();
 
-const key = () =>
-    `${C().characterId ?? C().groupId ?? 'global'}::${C().chatId ?? 'default'}`;
+const key = () => campaignKey(C());
+let pendingActions = Promise.resolve();
+
+const contextBridge = createContextBridge({
+    getContext: C,
+    readState: async campaign => (await api('/state?campaign=' + encodeURIComponent(campaign), {
+        signal: AbortSignal.timeout(10000),
+    })).state,
+    waitForActions: () => pendingActions,
+    onState: next => {
+        state = next;
+        $('#rpg-server-status').text('SQLite connected');
+        render();
+    },
+    onStatus: (status, prompt) => {
+        $('#rpg-context-status').text(status);
+        $('#rpg-context-preview').text(prompt || 'A fresh snapshot is fetched before each generation.');
+    },
+    onError: error => {
+        $('#rpg-server-status').text('RPG state unavailable');
+        console.error('[RPG Engine] Context unavailable', error);
+        toastr.error('RPG state could not be loaded. Generation stopped to avoid stale stats. Check the server plugin, then retry.');
+    },
+});
+
+// Registered immediately, before asynchronous panel loading. SillyTavern awaits this hook.
+globalThis.stRpgEngineInjectContext = contextBridge.inject;
 
 async function api(p, o = {}) {
     const r = await fetch(API + p, {
@@ -129,33 +156,41 @@ function render() {
 }
 
 async function load() {
+    const campaign = key();
     try {
-        state = (
-            await api('/state?campaign=' + encodeURIComponent(key()))
-        ).state;
-
+        const result = await api('/state?campaign=' + encodeURIComponent(campaign), {
+            signal: AbortSignal.timeout(10000),
+        });
+        if (campaign !== key()) return;
+        state = result.state;
         $('#rpg-server-status').text('SQLite connected');
-
         render();
     } catch (e) {
+        if (campaign !== key()) return;
         $('#rpg-server-status').text('Server plugin offline');
         console.error('[RPG Engine]', e);
     }
 }
 
 async function act(action, payload = {}) {
-    state = (
-        await api('/action', {
+    const campaign = key();
+    contextBridge.clear();
+    const operation = pendingActions.then(async () => {
+        const result = await api('/action', {
             method: 'POST',
-            body: JSON.stringify({
-                campaign: key(),
-                action,
-                payload,
-            }),
-        })
-    ).state;
-
-    render();
+            signal: AbortSignal.timeout(10000),
+            body: JSON.stringify({ campaign, action, payload }),
+        });
+        if (campaign === key()) {
+            state = result.state;
+            render();
+        }
+    });
+    pendingActions = operation.catch(error => {
+        console.error('[RPG Engine] Action failed', error);
+        toastr.error('The RPG change could not be saved. Refresh the panel and try again.');
+    });
+    await pendingActions;
 }
 
 async function init() {
@@ -174,6 +209,15 @@ async function init() {
     );
 
     $('#rpg-refresh').on('click', load);
+
+    C().eventSource.on(C().eventTypes.CHAT_CHANGED, () => {
+        contextBridge.clear();
+        state = null;
+        $('#rpg-char-name').text('Loading…');
+        $('#rpg-resources, #rpg-conditions, #rpg-inventory, #rpg-history').empty();
+        load();
+    });
+    contextBridge.clear();
 
     $('#rpg-next-turn').on('click', () => act('next_turn'));
 
